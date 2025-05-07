@@ -1,5 +1,7 @@
 import time
 import asyncio
+import httpx
+
 from typing import List
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, Page
@@ -7,6 +9,10 @@ from playwright.async_api import async_playwright
 from playwright.async_api import Page as AsyncPage
 from tqdm import tqdm
 from tenacity import retry, stop_after_attempt
+from httpx import AsyncClient
+
+httpx_client = AsyncClient()
+
 
 async def page_pool_worker(
     worker_id: int,
@@ -245,8 +251,108 @@ def result_parser(table_html: str):
     }
     return result
 
+async def get_page_data(page_url: str) -> BeautifulSoup:
+    """
+    Asynchronously fetches and parses the HTML content of a given webpage.
+
+    Args:
+        page_url (str): The URL of the webpage to fetch.
+
+    Returns:
+        BeautifulSoup: A BeautifulSoup object representing the parsed HTML content of the webpage.
+
+    Raises:
+        httpx.HTTPStatusError: If the HTTP request fails or returns an error status code.
+        httpx.RequestError: If there is an issue with the HTTP request.
+    """
+    try:
+        page = await httpx_client.get(page_url)
+    except httpx.ReadTimeout:
+        return {
+            "error_type": "ReadTimeout",
+        }
+    soup = BeautifulSoup(page.text, "html.parser")
+
+    selectors = {
+        "head_title": "#topPage > div.bodyContainer > div.container > div.content-text.content-apex > div > div > div > table > tbody > tr",
+        "project_table": "#DASHBOARD_LISTPROJECT",
+        "legal_table": "#DASHBOARD_LISTLEGAL",
+        "date_table": "#DASHBOARD_LISTIMPLEMENTATIONDATES",
+        "relation_table": "#DASHBOARD_LISTRELATIONS"
+    }
+    result = {}
+    for key, selector in selectors.items():
+        element = soup.select_one(selector)
+        if element:
+            result[key] = element.prettify()
+        else:
+            result[key] = None
+    return result
+
+async def get_pages_data(pages: List[str], batch_size: int = 5, wait_time: int = 1):
+    for page_batch in tqdm(range(0, len(pages), batch_size), desc="Fetching pages"):
+        tasks = []
+        for page_url in pages[page_batch:page_batch + batch_size]:
+            tasks.append(asyncio.create_task(get_page_data(page_url), name=page_url))
+        for task in asyncio.as_completed(tasks):
+            try:
+                result = await task
+                yield result
+            except Exception as e:
+                print(f"Error fetching page: {e}")
+                yield {"error_type": type(e)}
+        await asyncio.sleep(wait_time) 
+    
+    
 if __name__ == "__main__":
-    from pprint import pprint
-    result = query_standards_by_playwright_browser("EN 60335-1")
-    for r in result:
-        pprint(r)
+    # Query for standards
+    # from pprint import pprint
+    # result = query_standards_by_playwright_browser("EN 60335-1")
+    # for r in result:
+    #     pprint(r)
+
+    # Query for page standard
+    # import asyncio
+    # page_url = "https://standards.cencenelec.eu/dyn/www/f?p=CENELEC:110:::::FSP_PROJECT,FSP_ORG_ID:43616,1257159&cs=16ACCE68B15BAD3708DA2B3329B490230"
+    # print(asyncio.run(get_page_data(page_url)).prettify())
+
+    # Query for multiple pages
+    async def main():
+        import jsonlines
+        data = []
+        with jsonlines.open("data/query_result.jsonl", mode="r") as writer:
+            for line in writer:
+                for standard in line["standards"]:
+                    line_basic_data = {
+                        k: v for k, v in line.items() if k != "standards"
+                    }
+                    line_basic_data["standard"] = standard
+                    data.append(line_basic_data)
+        with jsonlines.open("data/pages_result.jsonl", mode="w") as writer:
+            pages_url = [f"https://standards.cencenelec.eu/dyn/www/{standard['standard']["url"]}" for standard in data]
+            results =  get_pages_data(pages_url, batch_size=20, wait_time=0)
+            ind = 0
+            async for result in results:
+                if "error_type" in result:
+                    writer.write({
+                        **data[ind],
+                        "error": result["error_type"],
+                        "page_info": None
+                    })
+                else:
+                    writer.write({
+                        **data[ind],
+                        "page_info": result
+                    })
+                ind += 1
+    asyncio.run(main())
+
+            
+
+
+
+    
+
+
+
+
